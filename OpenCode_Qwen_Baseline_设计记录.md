@@ -1,17 +1,14 @@
 # OpenCode + Qwen2.5-3B-Instruct 配置与 tiny-agents Baseline 设计记录
 
 > 生成时间：2026-04-28
-> 关键词：OpenCode、vLLM、Qwen2.5-3B、子 Agent 架构、BudgetOrchestrator、Pipeline
+> 更新时间：2026-04-28（Qwen3.5-9B 升级）
+> 关键词：OpenCode、vLLM、Qwen3.5-9B、子 Agent 架构、BudgetOrchestrator、Pipeline
 
 ---
 
 ## 一、OpenCode + Qwen2.5-3B-Instruct 配置
 
-### 1.1 背景
-
-OpenCode 是一个本地 Code Agent 框架，支持通过 `--provider opencode` 指定后端模型。项目旨在使用小模型（0.5B-3B）在本地完成编程任务，减少对云端 API 的依赖。
-
-### 1.2 最终配置
+### 1.1 最终配置
 
 ```bash
 VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 CUDA_VISIBLE_DEVICES=2 python3 -m vllm.entrypoints.openai.api_server \
@@ -27,68 +24,86 @@ VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 CUDA_VISIBLE_DEVICES=2 python3 -m vllm.entrypoin
   --tool-call-parser qwen3_coder
 ```
 
-**启动验证：**
-```bash
-curl http://localhost:18000/v1/models
-# 返回: {"object":"list","data":[{"id":"Qwen2.5-3B-Instruct",...,"max_model_len":48000}]}
-```
-
-**OpenCode 调用测试：**
-```bash
-~/.opencode/bin/opencode run "What is 2+2? Answer in one word."
-# 输出: "four"
-```
-
-### 1.3 关键配置项解释
-
-| 参数 | 值 | 说明 |
-|------|-----|------|
-| `port` | 18000 | vLLM API 端口，OpenCode 默认连接本地 18000 |
-| `max_model_len` | 48000 | 最大上下文长度 |
-| `gpu-memory-utilization` | 0.90 | GPU 显存占用比例 |
-| `VLLM_ALLOW_LONG_MAX_MODEL_LEN=1` | env | 允许超出模型原始位置编码限制 |
-| `enable-auto-tool-choice` | flag | 启用自动工具选择 |
-| `tool-call-parser` | qwen3_coder | Qwen 工具调用解析器 |
-
-### 1.4 重要发现与问题
+### 1.2 关键问题
 
 #### 问题 1：32k context 不够用
 
-**现象：** 早期配置使用 `max_model_len=32000`，OpenCode 请求 `max_tokens=32000`，加上系统 prompt 和工具定义后，总 context 超过 32768 限制。
+**现象：** OpenCode 请求中自己指定了 `max_tokens=32000`，加上系统 prompt 和工具定义后，总 context 超过 32768 限制。
 
-**原因：** OpenCode 请求中自己指定了 `max_tokens`，而非依赖 vLLM 的 `override-generation-config`。因此即使设置生成配置覆盖也无效。
-
-**解决：** 将 `max_model_len` 提高到 48000，以容纳 `32000 output + 工具 overhead`。
+**解决：** 将 `max_model_len` 提高到 48000，但会导致 RoPE 警告。
 
 #### 问题 2：RoPE 位置编码警告
 
-**警告信息：**
-```
-User-specified max_model_len (48000) is greater than the derived max_model_len
-(max_position_embeddings=32768.0 or model_max_length=None in model's config.json).
-VLLM_ALLOW_LONG_MAX_MODEL_LEN must be used with extreme caution.
-If the model uses relative position encoding (RoPE), positions exceeding
-derived_max_model_len lead to nan.
-```
-
-**影响：** 当生成长度超过 32768 时，attention score 可能出现 NaN，输出质量不可预测。短输出（如 "2+2"）不受影响，但复杂代码生成存在风险。
-
-**建议：** 如需稳定生成，考虑将 `max_model_len` 设置为 32768 或略高（36000 左右），同时在 OpenCode 调用时限制 `max_tokens`。
+**警告：** `max_model_len (48000) > max_position_embeddings (32768)`，超过 32768 时 attention score 可能出现 NaN。
 
 #### 问题 3：代理连接重置
 
-**现象：**
-```
-ConnectionResetError: [Errno 104] Connection reset by peer
-```
-
-**原因：** vLLM server 在处理某些请求时主动断开了连接，可能与生成长度超限或 RoPE 异常有关。
+`ConnectionResetError: [Errno 104] Connection reset by peer`，可能与生成长度超限或 RoPE 异常有关。
 
 ---
 
-## 二、tiny-agents Baseline 架构
+## 二、升级方案：Qwen3.5-9B
 
-### 2.1 项目概述
+### 2.1 为什么升级到 9B
+
+| | Qwen2.5-3B | Qwen3.5-9B |
+|---|---|---|
+| 层数 | 36 | 32 |
+| hidden_size | 2048 | 4096 |
+| 注意力头 | 24 | 16 (GQA, 4 KV heads) |
+| max_position | 32,768 | **262,144** |
+| 存储格式 | 单文件 ~2.8GB | 4分片 ~19GB |
+| bfloat16 显存 | ~7GB | ~18GB |
+
+**核心优势：**
+- **262k context**：彻底解决 RoPE NaN 问题，不再需要 `VLLM_ALLOW_LONG_MAX_MODEL_LEN` hack
+- **GQA 效率**：4 个 KV heads，attention 效率高于 3B 的全量 attention
+- **线性注意力层**：混合 linear attention + full attention，理论吞吐量更高
+- **更强推理能力**：9B 参数在复杂代码生成、多步推理上显著优于 3B
+
+### 2.2 最终配置
+
+```bash
+CUDA_VISIBLE_DEVICES=3 python3 -m vllm.entrypoints.openai.api_server \
+  --model /home/jinxu/.cache/tiny-agents/models/Qwen/Qwen3.5-9B \
+  --served-model-name Qwen3.5-9B \
+  --port 18001 \
+  --gpu-memory-utilization 0.90 \
+  --max-model-len 262144 \
+  --tensor-parallel-size 1 \
+  --trust-remote-code \
+  --load-format safetensors \
+  --enable-auto-tool-choice \
+  --tool-call-parser qwen3_coder
+```
+
+**启动验证：**
+```bash
+curl http://localhost:18001/v1/models
+# 返回: {"object":"list","data":[{"id":"Qwen3.5-9B",...,"max_model_len":262144}]}
+```
+
+### 2.3 重要发现：Qwen3.5-9B 默认启用思考
+
+**现象：** 模型默认输出超长思考过程（2+2 这种问题都能写 2000+ tokens 思考），通过 `extra_body` 传 `thinking: false` 或 `enable_thinking: false` 均无效。
+
+**原因：** Qwen3.5 的思考机制由 chat_template 硬编码控制，不受 vLLM API 参数控制。
+
+**影响：**
+- 简单问题响应变慢（先思考再回答）
+- API max_tokens 限制可能导致输出被截断（finish_reason: length）
+- OpenCode 调用时需注意分配足够 max_tokens
+
+**建议：**
+- 简单任务：给充足 max_tokens（≥2000）让思考完成
+- 复杂代码任务：思考过程可能有助于分析问题，可保留
+- 如需严格无思考：考虑用 Qwen2.5-3B 或通过 prompt 约束输出格式
+
+---
+
+## 三、tiny-agents Baseline 架构
+
+### 3.1 项目概述
 
 tiny-agents 是一个基于小模型（Qwen2.5 0.5B-3B）的多 Agent 框架，使用 vLLM 作为推理后端。项目包含三套并行的 Agent 编排架构，适用于不同场景。
 
@@ -120,7 +135,7 @@ tiny_agents/
 └── tools/           # 工具实现
 ```
 
-### 2.2 三套编排架构对比
+### 3.2 三套编排架构对比
 
 | 架构 | 类型 | 子 Agent 调用方式 | 并行支持 | 预算控制 | 适用场景 |
 |------|------|------------------|----------|----------|----------|
@@ -130,9 +145,9 @@ tiny_agents/
 
 ---
 
-## 三、Orchestrator — 串行链式委托
+## 四、Orchestrator — 串行链式委托
 
-### 3.1 设计原理
+### 4.1 设计原理
 
 ```python
 # 核心循环
@@ -152,7 +167,7 @@ while iteration < max_iterations:
         continue  # 同一 Agent 继续
 ```
 
-### 3.2 AgentOutput 动作类型
+### 4.2 AgentOutput 动作类型
 
 ```python
 class AgentOutput(BaseModel):
@@ -170,7 +185,7 @@ class AgentOutput(BaseModel):
 | `review` | Critic 审查完成，等待决策 |
 | `parallel` | （代码中存在但未完整实现） |
 
-### 3.3 局限性
+### 4.3 局限性
 
 - **串行执行**：每次只有一个 Agent 在运行
 - **无 KV Cache 共享**：每个 Agent 实例独立，即使同模型也无法复用
@@ -179,9 +194,9 @@ class AgentOutput(BaseModel):
 
 ---
 
-## 四、BudgetOrchestrator — 预算感知多 Agent 协作
+## 五、BudgetOrchestrator — 预算感知多 Agent 协作
 
-### 4.1 设计原理
+### 5.1 设计原理
 
 ```
 BudgetController.decide(s_t, c_t) ← BEFORE action!
@@ -201,7 +216,7 @@ BudgetController.decide(s_t, c_t) ← BEFORE action!
            continue
 ```
 
-### 4.2 Phase 1 固定调度（无隐藏智能）
+### 5.2 Phase 1 固定调度（无隐藏智能）
 
 ```python
 PHASE1_SCHEDULE = [
@@ -216,7 +231,7 @@ PHASE1_SCHEDULE = [
 - 奇数步 = reasoner，偶数步 = critic
 - 调度规则**完全显式**，无任何隐藏决策逻辑
 
-### 4.3 核心状态变量
+### 5.3 核心状态变量
 
 | 变量 | 说明 |
 |------|------|
@@ -226,21 +241,17 @@ PHASE1_SCHEDULE = [
 | `last_verifier_output` | 上次验证结果，影响 reasoner 后续响应 |
 | `_has_seen_verifier_output` | 标记是否看过 verifier 输出 |
 
-### 4.4 子 Agent 调用机制
+### 5.4 子 Agent 调用机制
 
 ```python
 async def _execute_atomic_step(self, problem, budget_state):
-    # 根据 fixed schedule 或 verifier feedback 选择 Agent
     if self._has_seen_verifier_output:
         agent_name = self.reasoner_name
         instruction = f"Based on verifier's feedback, revise..."
     else:
         agent_name, action_type = self._get_next_in_schedule()
 
-    # 构建 prompt
     prompt = self._build_step_prompt(problem, agent_name, action_type)
-
-    # 调用 Agent
     backend = self.agent_backends.get(agent_name, self.llm_backend)
     response = backend.chat([{"role": "user", "content": prompt}])
 
@@ -251,9 +262,9 @@ async def _execute_atomic_step(self, problem, budget_state):
 
 ---
 
-## 五、Pipeline — DAG 流水线（唯一支持并行的架构）
+## 六、Pipeline — DAG 流水线（唯一支持并行的架构）
 
-### 5.1 设计原理
+### 6.1 设计原理
 
 Pipeline 是一个有向无环图（DAG）处理流水线，每个节点是 `PipelineStep`，边是数据依赖。支持 `parallel=True` 的节点在依赖满足时并发执行。
 
@@ -268,7 +279,7 @@ pipe = Pipeline(steps)
 result = await pipe.run({"topic": "LoRA in Vision Models"})
 ```
 
-### 5.2 依赖解析与并行
+### 6.2 依赖解析与并行
 
 ```python
 def _resolve_order(self) -> List[List[str]]:
@@ -277,7 +288,7 @@ def _resolve_order(self) -> List[List[str]]:
     # 同组内并行执行，组间串行
 ```
 
-### 5.3 子 Agent 调用
+### 6.3 子 Agent 调用
 
 ```python
 async def run_one(step_id):
@@ -291,21 +302,19 @@ async def run_one(step_id):
     elif step._is_tool():
         result = step.runner.execute(step_input)
 
-    # 存储输出到 context
     for key in step.output_keys:
         context[key] = result[key]
 
     return step_id, result, None
 
-# 并发执行同组步骤
 results = await asyncio.gather(*[run_one(sid) for sid in group])
 ```
 
 ---
 
-## 六、子 Agent 优化的现状与问题
+## 七、子 Agent 优化的现状与问题
 
-### 6.1 当前优化情况
+### 7.1 当前优化情况
 
 | 优化点 | 状态 | 说明 |
 |--------|------|------|
@@ -315,56 +324,43 @@ results = await asyncio.gather(*[run_one(sid) for sid in group])
 | 预算感知调度 | ✅ | BudgetOrchestrator 有完整 BudgetController |
 | 固定调度（可解释） | ✅ | BudgetOrchestrator Phase 1 完全显式 |
 | 工具调用内联 | ✅ | Orchestrator 内联执行，不走子进程 |
+| 超长上下文 | ✅ (9B) | 9B 支持 262k context，3B 的 RoPE NaN 问题不复存在 |
 
-### 6.2 核心未解决问题
+### 7.2 核心未解决问题
 
-#### 6.2.1 延迟瀑布（Latency Cascade）
+#### 7.2.1 延迟瀑布（Latency Cascade）
 
 ```
 用户请求 → Router → [Tool A] → [Tool B] → Worker → [Tool C] → Critic → 响应
               ↑______________每个箭头是一次完整的 LLM 往返延迟______________↑
 ```
 
-**影响：** 每多一层 Agent 调用，增加一次完整推理延迟。对于 3B 模型，单次推理约 0.5-2s，多层累积可达 10s+。
+**影响：** 每多一层 Agent 调用，增加一次完整推理延迟。对于 3B 模型单次推理约 0.5-2s，多层累积可达 10s+。9B 模型单次推理约 2-5s，延迟问题更明显。
 
-#### 6.2.2 上下文膨胀（Context Explosion）
+#### 7.2.2 上下文膨胀（Context Explosion）
 
-每个 Agent 的 `system prompt` 包含：
-- Role 定义
-- 工具 schema
-- 行为约束
-- 示例
+每个 Agent 的 `system prompt` 包含：Role 定义、工具 schema、行为约束、示例。10 个子 Agent 意味着相同工具定义被重复编码 N 次。
 
-**问题：** 10 个子 Agent 意味着相同的工具定义被重复编码 N 次。
+#### 7.2.3 KV Cache 无法跨实例共享
 
-#### 6.2.3 KV Cache 无法跨实例共享
+即使所有 Agent 使用同一模型、运行在同一 GPU、使用同一个 vLLM server，每个 `backend.chat()` 调用仍然需要重新编码 system prompt，无法复用之前的 KV cache。
 
-即使：
-- 所有 Agent 使用同一模型（Qwen2.5-3B）
-- 运行在同一 GPU 上
-- 使用同一个 vLLM server
+#### 7.2.4 模型 thinking 机制影响响应速度
 
-每个 `backend.chat()` 调用仍然需要重新编码 system prompt，无法复用之前的 KV cache。
+Qwen3.5-9B 默认启用思考机制，简单问题响应延迟显著增加。无法通过 API 参数关闭。
 
-#### 6.2.4 小模型调度 overhead 占比高
-
-对于 0.5B-3B 模型：
-- LLM 推理时间：0.5-2s
-- Agent 调度 overhead（序列化、IPC、结果聚合）：0.1-0.5s
-
-**overhead 可能占 10-50%**，远高于大模型场景。
-
-### 6.3 改进方向
+### 7.3 改进方向
 
 1. **浅层委托**：限制 Agent 嵌套深度（建议 ≤ 2 层）
 2. **共享 LLM 实例**：同 GPU + 同模型用同一个 vLLM backend，复用连接
 3. **Pipeline 并行**：对可分解任务，优先用 Pipeline 而非 Orchestrator
 4. **上下文缓存**：在调用前将固定 system prompt 的 KV cache 预热
 5. **路由前置**：用轻量模型做调度判断，减少不必要的 Agent 调用
+6. **thinking 控制**：对简单任务通过 prompt 约束避免过度思考
 
 ---
 
-## 七、相关文件索引
+## 八、相关文件索引
 
 | 文件 | 作用 |
 |------|------|
